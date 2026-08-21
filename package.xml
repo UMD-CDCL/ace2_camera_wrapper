@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>ace2_camera_wrapper</name>
+  <version>0.1.0</version>
+  <description>Wrapper for grabbing color images from a Basler ace 2 a2A2448-75ucPRO USB3 camera via the pylon SDK</description>
+  <maintainer email="srijal.poojari@gmail.com">Srijal Poojari</maintainer>
+  <license>TODO: License declaration</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <depend>rclcpp</depend>
+  <depend>rclcpp_components</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>image_transport</depend>
+  <depend>camera_info_manager</depend>
+
+  <!-- The pylon SDK is installed outside the ROS dependency system, at
+       /opt/pylon (or wherever PYLON_ROOT points), so it has no rosdep key. -->
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
