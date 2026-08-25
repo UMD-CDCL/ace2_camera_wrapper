@@ -7,6 +7,11 @@
 #   ros2 launch ace2_camera_wrapper ace2_camera_wrapper.launch.py \
 #       frame_rate:=60.0 exposure_auto:=Off
 #
+# For a camera that is not mounted upright, `image_rotation` turns the published
+# frame clockwise and `flip_horizontal` / `flip_vertical` mirror it, e.g.
+#
+#   ros2 launch ace2_camera_wrapper ace2_camera_wrapper.launch.py image_rotation:=90
+#
 # Sensible starting points for this camera:
 #   * pixel_format BayerRG8 + output_encoding bgr8 is the fast path. A frame is
 #     2448x2048, so 5.0 MB as Bayer against the camera's 360 MB/s link budget
@@ -63,6 +68,19 @@ def generate_launch_description():
             description='Upper bound in us for the auto exposure. Keep it below '
                         '1e6/frame_rate, or the auto function will hold the frame rate '
                         'down to reach its brightness target.'),
+        DeclareLaunchArgument(
+            'image_rotation', default_value='0',
+            description='Rotate the published image clockwise by 0, 90, 180 or 270 '
+                        'degrees, for a camera that is not mounted upright. 90 and 270 '
+                        'swap the published width and height.'),
+        DeclareLaunchArgument(
+            'flip_horizontal', default_value='false',
+            description='Mirror the published image about its vertical axis, before '
+                        'image_rotation.'),
+        DeclareLaunchArgument(
+            'flip_vertical', default_value='false',
+            description='Mirror the published image about its horizontal axis, before '
+                        'image_rotation.'),
         DeclareLaunchArgument(
             'stats_log_period', default_value='0.0',
             description='Log the measured grab rate every N seconds. 0 disables.'),
@@ -149,8 +167,32 @@ def generate_launch_description():
         'image_height': 0,
         'offset_x': -1,                    # -1 centres the ROI on the sensor
         'offset_y': -1,
+        # --------------------------------------------------------- orientation -
+        # Two ways to turn the image, and they are not interchangeable.
+        #
+        # reverse_x / reverse_y mirror on the sensor and cost nothing, but they
+        # shift the phase of the Bayer tile without the camera saying so, so with
+        # the Bayer pixel_format above they wreck the colours. They are only safe
+        # alongside a Mono or an RGB/BGR pixel_format.
         'reverse_x': False,                # mirror horizontally on the camera
         'reverse_y': False,                # mirror vertically on the camera
+
+        # image_rotation / flip_horizontal / flip_vertical turn the frame on the
+        # host instead. They fold into a single pass, relabel the Bayer pattern
+        # and rewrite CameraInfo to match, so they are the ones to use for a
+        # rotated mounting. The flips happen first, then the clockwise rotation.
+        #
+        # The cost is one extra pass over the frame. A 90 or 270 rotation
+        # transposes, so it moves a pixel at a time rather than a row at a time
+        # and is the expensive case; 180 and the plain flips stay row-wise. All
+        # three are read once when the node starts, so the grab loop pays a
+        # single branch per frame and never a lock.
+        'image_rotation': ParameterValue(
+            LaunchConfiguration('image_rotation'), value_type=int),
+        'flip_horizontal': ParameterValue(
+            LaunchConfiguration('flip_horizontal'), value_type=bool),
+        'flip_vertical': ParameterValue(
+            LaunchConfiguration('flip_vertical'), value_type=bool),
 
         # ---------------------------------------------------------- exposure --
         'exposure_auto': ParameterValue(

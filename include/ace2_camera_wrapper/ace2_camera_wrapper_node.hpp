@@ -116,7 +116,52 @@ private:
 
   void resolveOutputFormat();
 
+  void setPublishedEncoding(const std::string & encoding);
+
   void resyncCameraClock();
+
+
+  // ---------------------------------------------------------------- orientation
+
+  // How a frame is turned before it is published, for a camera that is mounted
+  // rotated or mirrored. image_rotation, flip_horizontal and flip_vertical fold
+  // into one element of the symmetry group of the rectangle, so any combination
+  // of the three costs exactly one pass over the frame rather than one pass each.
+  //
+  // Canonical form: transpose first, then mirror about the vertical axis, then
+  // mirror about the horizontal axis. Composed once at startup and read on the
+  // grab thread thereafter, so turning a frame costs one predictable branch and
+  // no synchronisation.
+  struct Orientation
+  {
+    bool transpose{false};
+    bool flip_x{false};
+    bool flip_y{false};
+
+    bool identity() const {return !transpose && !flip_x && !flip_y;}
+  };
+
+  // Folds the user's "mirror in sensor coordinates, then rotate clockwise" into
+  // the canonical form above.
+  static Orientation orientationOf(int64_t rotation, bool flip_horizontal, bool flip_vertical);
+
+  static bool validRotation(int64_t rotation);
+
+  // Moves the pixels. src and dst must not overlap.
+  static void applyOrientation(
+    const Orientation & o, const uint8_t * src, size_t src_stride,
+    uint32_t src_width, uint32_t src_height, size_t pixel_bytes,
+    uint8_t * dst, size_t dst_stride);
+
+  // A Bayer encoding names the phase of the colour tile, and turning the pixels
+  // shifts that phase, so the published name has to follow. Any other encoding
+  // comes back unchanged.
+  static std::string reorientEncoding(const std::string & encoding, const Orientation & o);
+
+  // Rewrites the intrinsics to describe the turned image. Returns false when the
+  // distortion model has coefficients this does not know how to rewrite, in
+  // which case the geometry is still correct but D is left alone.
+  static bool reorientCameraInfo(sensor_msgs::msg::CameraInfo & info, const Orientation & o);
 
 
   // Snapshot of the fields the executor thread may change under us, taken once
@@ -176,6 +221,10 @@ private:
   int64_t image_height_{0};
   int64_t offset_x_{-1};
   int64_t offset_y_{-1};
+  int64_t image_rotation_{0};
+  bool flip_horizontal_{false};
+  bool flip_vertical_{false};
+  Orientation orientation_;
   int64_t device_link_throughput_limit_{0};
   int64_t max_transfer_size_{0};
   int64_t num_max_queued_urbs_{0};
@@ -209,6 +258,12 @@ private:
   bool triggered_{false};
   bool convert_{true};
   std::string ros_encoding_;
+  // ros_encoding_ after the orientation has shifted a Bayer phase, which is what
+  // the message actually carries. Equal to ros_encoding_ for everything else.
+  std::string published_encoding_;
+  // Scratch for the conversion when an orientation follows it, so the converter
+  // still writes once and the orientation pass reads from it. Grab thread only.
+  std::vector<uint8_t> convert_buffer_;
 
   // Device-clock anchor for timestamp_source == "camera". Written by the grab
   // thread under camera_mutex_, read by stampFor on the same thread, so atomics
