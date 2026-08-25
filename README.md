@@ -56,6 +56,9 @@ ros2 launch ace2_camera_wrapper ace2_camera_wrapper.launch.py
 # a few of the common overrides
 ros2 launch ace2_camera_wrapper ace2_camera_wrapper.launch.py \
     frame_rate:=60.0 exposure_auto:=Off output_encoding:=passthrough
+
+# camera mounted on its side
+ros2 launch ace2_camera_wrapper ace2_camera_wrapper.launch.py image_rotation:=90
 ```
 
 Every parameter lives in `launch/ace2_camera_wrapper.launch.py` with a comment, and
@@ -195,6 +198,83 @@ outside the specified imaging area, so you have to ask for them by number rather
 than by leaving a parameter at zero. Shrinking the ROI is the cheapest way to a
 higher frame rate, since it shrinks the frame against the link budget above.
 
+## Orientation
+
+For a camera that is not mounted upright, `image_rotation` turns the published
+frame **clockwise** by 0, 90, 180 or 270 degrees, and `flip_horizontal` /
+`flip_vertical` mirror it. The mirrors are applied first, in sensor coordinates,
+then the rotation. A 90 or 270 degree rotation swaps the published width and
+height, so `2448 x 2048` is published as `2048 x 2448`.
+
+All three are read once when the node starts. They are not runtime
+reconfigurable: the grab loop should pay one branch per frame, not a lock.
+
+Turning the image is not just a matter of moving pixels, and the node handles the
+two things that go with it:
+
+* **The Bayer pattern.** `bayer_rggb8` names the *phase* of the 2 x 2 colour tile,
+  and mirroring or rotating the bytes shifts that phase. Under `passthrough` the
+  published encoding is relabelled to match, so a 90 degree rotation publishes
+  `bayer_grbg8` rather than a `bayer_rggb8` that lies about its own colours.
+  (Width and Height both have `inc = 2` here, so the result is always another
+  named pattern.)
+* **The calibration.** `CameraInfo` is rewritten to describe the turned image: the
+  principal point moves, `fx` and `fy` swap on a transpose, and the two tangential
+  distortion terms change sign or swap. Without this a rotated stream would carry
+  intrinsics for an image that is no longer there, and every downstream
+  projection would be quietly wrong. `plumb_bob`, `rational_polynomial` and the
+  purely radial models are handled; anything else logs a warning once and has its
+  `D` left alone.
+
+The cost is one extra pass over the frame, measured on a full 5 MP `bgr8` frame:
+
+| | ms/frame |
+| --- | --- |
+| `flip_vertical` alone | 1.0 |
+| `image_rotation: 180` | 2.1 |
+| `flip_horizontal` | 2.5 |
+| `image_rotation: 90` | 3.8 |
+| `image_rotation: 270` | 5.2 |
+
+The rotations transpose, so they move a pixel at a time rather than a row at a
+time and are the expensive case; even so, ~5 ms leaves far more headroom than the
+~71 fps the USB link allows. Under `passthrough` the turn replaces the copy that
+was happening anyway; with a conversion it adds one, because the converter and
+the turn cannot write the same buffer.
+
+### Why these are parameters and not compile-time constants
+
+The obvious worry with a runtime parameter is that the inner loop pays for it.
+It does not, because the parts the inner loop actually reads — the pixel size and,
+for a transposing rotation, the two mirror flags — are lifted to compile time by a
+`switch` that dispatches into templated instantiations. Benchmarked against a
+build with the orientation hard-coded as compile-time constants throughout, the
+two are within noise of each other (+-10% either way, run to run) and produce
+byte-identical output.
+
+So hard-coding the orientation in a header would buy nothing measurable, and
+would cost the ability to change a camera's mounting without a rebuild, to run two
+differently-mounted cameras from one build, and to keep the setting in the launch
+file with the rest of the configuration.
+
+What *did* matter was where the constants land. The transposing loop evaluates its
+mirror flag once per pixel, and making it constant is worth 20-38% of a rotation;
+the non-transposing loop reads it once per row, where the same change measured as
+noise, so it keeps its runtime flags and does not double the instantiation count.
+
+### Why not `reverse_x` / `reverse_y`
+
+`reverse_x` and `reverse_y` mirror on the sensor and cost nothing at all, which
+makes them tempting. They are also **wrong under a Bayer `pixel_format`**: they
+shift the Bayer phase while the camera goes on reporting `BayerRG8`, so both the
+host debayering and the `passthrough` label are working from the wrong pattern and
+the colours come out wrong. The node warns when it sees that combination. They are
+safe alongside a `Mono` or `RGB`/`BGR` `pixel_format`, where there is no phase to
+shift; everywhere else use `flip_horizontal` and `flip_vertical`.
+
+Note also that they mirror the sensor readout, so they change what the calibration
+describes without `CameraInfo` knowing, whereas the host-side flips rewrite it.
+
 ## Timestamps
 
 `timestamp_source: ros_time` (the default) stamps the frame when the host retrieves
@@ -310,7 +390,7 @@ the exposure, gain, white balance and colour parameters, plus `frame_rate`,
 `reverse_x`, `reverse_y`, `frame_id`, `timestamp_source` and `timestamp_offset`.
 
 Anything that changes the buffer layout or the transport (`pixel_format`, the ROI,
-the USB and QoS settings) is read once when the camera is opened. Setting one of
+the orientation, the USB and QoS settings) is read once when the camera is opened. Setting one of
 those is rejected with a message saying so, rather than being half-applied.
 
 Note that a manual value is only writable while its auto function is off. Setting

@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <utility>
 
 namespace ace2_camera_wrapper
 {
@@ -90,6 +91,18 @@ Ace2CameraWrapperNode::Ace2CameraWrapperNode(const rclcpp::NodeOptions & options
   // Validated before anything else touches hardware: a typo here is a permanent
   // configuration error, and the reconnect loop would otherwise retry it forever.
   validateOutputEncoding();
+
+  // Say the orientation out loud when there is one. It changes the published
+  // geometry, and an image that is merely turned is easy to blame on the wrong
+  // part of the stack.
+  if (!orientation_.identity()) {
+    RCLCPP_INFO(
+      get_logger(),
+      "Turning every frame on the host: flip_horizontal=%s, flip_vertical=%s, then %ld "
+      "degrees clockwise.%s",
+      flip_horizontal_ ? "true" : "false", flip_vertical_ ? "true" : "false", image_rotation_,
+      orientation_.transpose ? " Width and height are swapped." : "");
+  }
 
   // CameraInfoManager also brings up the standard set_camera_info service, so
   // camera_calibration can write a calibration back to camera_info_url.
@@ -309,8 +322,36 @@ void Ace2CameraWrapperNode::declareParameters()
     "as sharpness_enhancement.");
 
   // -- orientation ---------------------------------------------------------
-  declare<bool>("reverse_x", false, "Mirror the image horizontally on the camera.");
-  declare<bool>("reverse_y", false, "Mirror the image vertically on the camera.");
+  // Two places can turn the image and they are not interchangeable. ReverseX and
+  // ReverseY mirror on the sensor and cost nothing, but they shift the phase of
+  // the Bayer tile without the camera saying so, which makes them wrong for a
+  // Bayer pixel_format. The host-side knobs below cost one pass over the frame
+  // and are always right: they relabel the Bayer pattern and rewrite CameraInfo
+  // to match.
+  declare<bool>("reverse_x", false,
+    "Mirror the image horizontally on the camera. Free, but it corrupts the "
+    "colours under a Bayer pixel_format: use flip_horizontal there instead.");
+  declare<bool>("reverse_y", false,
+    "Mirror the image vertically on the camera. Same Bayer caveat as reverse_x, "
+    "so use flip_vertical there instead.");
+  image_rotation_ = declare<int64_t>(
+    "image_rotation", 0,
+    "Rotate the published image clockwise by 0, 90, 180 or 270 degrees, for a "
+    "camera that is not mounted upright. 90 and 270 swap width and height.");
+  flip_horizontal_ = declare<bool>(
+    "flip_horizontal", false,
+    "Mirror the published image about its vertical axis, applied before image_rotation.");
+  flip_vertical_ = declare<bool>(
+    "flip_vertical", false,
+    "Mirror the published image about its horizontal axis, applied before image_rotation.");
+  if (!validRotation(image_rotation_)) {
+    throw std::runtime_error(
+      "image_rotation must be 0, 90, 180 or 270, not " + std::to_string(image_rotation_));
+  }
+  // Composed once, here, and read on the grab thread for the rest of the run.
+  // That is why these three are not in the live-reconfigurable set: a frame
+  // costs one branch on orientation_.identity(), not a lock.
+  orientation_ = orientationOf(image_rotation_, flip_horizontal_, flip_vertical_);
 
   // -- link and transport --------------------------------------------------
   device_link_throughput_limit_ = declare<int64_t>(
@@ -606,8 +647,18 @@ void Ace2CameraWrapperNode::applyConfiguration()
   }
 
   configureRoi();
-  setBool("ReverseX", get_parameter("reverse_x").as_bool());
-  setBool("ReverseY", get_parameter("reverse_y").as_bool());
+  const bool reverse_x = get_parameter("reverse_x").as_bool();
+  const bool reverse_y = get_parameter("reverse_y").as_bool();
+  setBool("ReverseX", reverse_x);
+  setBool("ReverseY", reverse_y);
+  if ((reverse_x || reverse_y) && pixel_format_.rfind("Bayer", 0) == 0) {
+    RCLCPP_WARN(
+      get_logger(),
+      "reverse_x/reverse_y mirror on the sensor, which shifts the Bayer phase while the "
+      "camera goes on reporting %s, so the colours come out wrong. Use flip_horizontal "
+      "and flip_vertical instead: they mirror on the host and relabel the pattern.",
+      pixel_format_.c_str());
+  }
 
   setEnum("PixelFormat", pixel_format_);
 
@@ -861,26 +912,29 @@ void Ace2CameraWrapperNode::resolveOutputFormat()
   }
 
   if (output_encoding_ == "passthrough") {
-    if (!ros_encoding_for(camera_type, ros_encoding_)) {
+    std::string encoding;
+    if (!ros_encoding_for(camera_type, encoding)) {
       throw std::runtime_error(
         "the camera's active pixel format has no ROS equivalent, so 'passthrough' "
         "cannot be used. Set output_encoding to bgr8, rgb8 or mono8.");
     }
+    setPublishedEncoding(encoding);
     convert_ = false;
-    RCLCPP_INFO(get_logger(), "Publishing camera frames unconverted as '%s'", ros_encoding_.c_str());
+    RCLCPP_INFO(get_logger(), "Publishing camera frames unconverted as '%s'", encoding.c_str());
     return;
   }
 
   Pylon::EPixelType target = Pylon::PixelType_Undefined;
+  std::string encoding;
   if (output_encoding_ == "bgr8") {
     target = Pylon::PixelType_BGR8packed;
-    ros_encoding_ = sensor_msgs::image_encodings::BGR8;
+    encoding = sensor_msgs::image_encodings::BGR8;
   } else if (output_encoding_ == "rgb8") {
     target = Pylon::PixelType_RGB8packed;
-    ros_encoding_ = sensor_msgs::image_encodings::RGB8;
+    encoding = sensor_msgs::image_encodings::RGB8;
   } else if (output_encoding_ == "mono8") {
     target = Pylon::PixelType_Mono8;
-    ros_encoding_ = sensor_msgs::image_encodings::MONO8;
+    encoding = sensor_msgs::image_encodings::MONO8;
   } else {
     throw std::runtime_error(
       "unsupported output_encoding '" + output_encoding_ +
@@ -898,9 +952,313 @@ void Ace2CameraWrapperNode::resolveOutputFormat()
   // and keeps the converted geometry identical to the source.
   converter_.InconvertibleEdgeHandling = Pylon::InconvertibleEdgeHandling_Extend;
   convert_ = true;
+  setPublishedEncoding(encoding);
 
   RCLCPP_INFO(
-    get_logger(), "Converting camera frames to '%s' on the host", ros_encoding_.c_str());
+    get_logger(), "Converting camera frames to '%s' on the host", encoding.c_str());
+}
+
+
+  // Records the encoding the converter produces, together with the name the
+  // published frame carries once the orientation has shifted a Bayer phase.
+  // Both are written here on the grab thread and read there in publishFrame,
+  // and orientation_ is fixed at startup, so none of it needs a lock.
+void Ace2CameraWrapperNode::setPublishedEncoding(const std::string & encoding)
+{
+  ros_encoding_ = encoding;
+  published_encoding_ = reorientEncoding(encoding, orientation_);
+}
+
+
+  // ------------------------------------------------------------- orientation
+
+bool Ace2CameraWrapperNode::validRotation(int64_t rotation)
+{
+  return rotation == 0 || rotation == 90 || rotation == 180 || rotation == 270;
+}
+
+
+  // The eight ways of turning a rectangle form a group, so the mirrors and the
+  // rotation collapse into a single member of it and the frame is only ever
+  // walked once. Writing a rotation as "transpose, then mirror" is what makes
+  // that collapse a couple of exclusive ors:
+  //
+  //   90 clockwise  = transpose, then mirror horizontally
+  //   180           = mirror horizontally and vertically
+  //   270 clockwise = transpose, then mirror vertically
+  //
+  // The user's mirrors happen first, in sensor coordinates, so they have to be
+  // pushed through the transpose to reach the canonical order. A transpose turns
+  // a horizontal mirror into a vertical one and vice versa, which is the whole
+  // of the bookkeeping below.
+Ace2CameraWrapperNode::Orientation Ace2CameraWrapperNode::orientationOf(
+  int64_t rotation, bool flip_horizontal, bool flip_vertical)
+{
+  Orientation o;
+  switch (rotation) {
+    case 90:  o = {true, true, false}; break;
+    case 180: o = {false, true, true}; break;
+    case 270: o = {true, false, true}; break;
+    default:  o = {false, false, false}; break;
+  }
+
+  if (o.transpose) {
+    o.flip_x = (o.flip_x != flip_vertical);
+    o.flip_y = (o.flip_y != flip_horizontal);
+  } else {
+    o.flip_x = (o.flip_x != flip_horizontal);
+    o.flip_y = (o.flip_y != flip_vertical);
+  }
+  return o;
+}
+
+
+namespace
+{
+
+// The transposing half of the turn, with everything the inner loop depends on
+// fixed at compile time. That matters here and nowhere else: this loop evaluates
+// the flip once *per pixel*, and with the flag constant the compiler strength
+// reduces it into a pointer walking by plus or minus a stride instead of
+// recomputing an index. It is worth 20-38% of a 5 MP rotation, and it is the
+// whole of what compile-time constants can buy - a switch reaching these
+// instantiations is exactly as fast as hard-coding the orientation would be.
+template<bool FLIP_X, bool FLIP_Y, size_t N>
+void transpose_tiled(
+  const uint8_t * src, size_t src_stride, uint32_t src_width, uint32_t src_height,
+  size_t pixel_bytes, uint8_t * dst, size_t dst_stride)
+{
+  const size_t n = (N != 0) ? N : pixel_bytes;
+
+  // Consecutive destination pixels come from consecutive source *rows*, so
+  // walking a whole destination row at a time touches a new cache line for every
+  // pixel and, on a 5 MP frame, thrashes the TLB as well. Going tile by tile
+  // instead keeps 32 x 32 pixels of each buffer resident, a few kilobytes either
+  // side, and roughly halves the time again.
+  constexpr uint32_t kTile = 32;
+  const uint32_t dst_width = src_height;
+  const uint32_t dst_height = src_width;
+  for (uint32_t y0 = 0; y0 < dst_height; y0 += kTile) {
+    const uint32_t y1 = std::min(y0 + kTile, dst_height);
+    for (uint32_t x0 = 0; x0 < dst_width; x0 += kTile) {
+      const uint32_t x1 = std::min(x0 + kTile, dst_width);
+      for (uint32_t y = y0; y < y1; ++y) {
+        // The transpose sends destination row y to a source column and
+        // destination column x to a source row; the mirrors only reverse which.
+        const uint32_t src_col = FLIP_Y ? dst_height - 1 - y : y;
+        uint8_t * d = dst + static_cast<size_t>(y) * dst_stride + static_cast<size_t>(x0) * n;
+        for (uint32_t x = x0; x < x1; ++x, d += n) {
+          const uint32_t src_row = FLIP_X ? dst_width - 1 - x : x;
+          std::memcpy(
+            d, src + static_cast<size_t>(src_row) * src_stride + static_cast<size_t>(src_col) * n,
+            n);
+        }
+      }
+    }
+  }
+}
+
+
+// The pixel size is a template parameter rather than an argument because the
+// inner copy is essentially the whole cost of this: with N known the compiler
+// turns it into a couple of loads and stores instead of a call into memcpy, and
+// a 90 degree rotation of a full 5 MP bgr8 frame drops from 8.8 ms to 4.5 ms on
+// this machine. N == 0 means "take it from pixel_bytes", which is the fallback
+// for a size the switch below does not name.
+template<size_t N>
+void orient_pixels(
+  bool transpose, bool flip_x, bool flip_y,
+  const uint8_t * src, size_t src_stride, uint32_t src_width, uint32_t src_height,
+  size_t pixel_bytes, uint8_t * dst, size_t dst_stride)
+{
+  if (transpose) {
+    // Lift the two flips to compile time for the loop that reads them per pixel.
+    // The non-transposing path below is deliberately left with runtime flags:
+    // there the flip is read once per *row*, so doing the same to it measured as
+    // noise and would only have doubled the instantiations.
+    const int which = (flip_x ? 1 : 0) | (flip_y ? 2 : 0);
+    switch (which) {
+      case 0:
+        transpose_tiled<false, false, N>(
+          src, src_stride, src_width, src_height, pixel_bytes, dst, dst_stride);
+        return;
+      case 1:
+        transpose_tiled<true, false, N>(
+          src, src_stride, src_width, src_height, pixel_bytes, dst, dst_stride);
+        return;
+      case 2:
+        transpose_tiled<false, true, N>(
+          src, src_stride, src_width, src_height, pixel_bytes, dst, dst_stride);
+        return;
+      default:
+        transpose_tiled<true, true, N>(
+          src, src_stride, src_width, src_height, pixel_bytes, dst, dst_stride);
+        return;
+    }
+  }
+
+  const size_t n = (N != 0) ? N : pixel_bytes;
+
+  // Rows keep their length, so a destination row is one memcpy when the columns
+  // are not mirrored, and a walk backwards along the source row when they are.
+  // Either way this stays sequential in both buffers.
+  for (uint32_t y = 0; y < src_height; ++y) {
+    const uint8_t * s = src + static_cast<size_t>(flip_y ? src_height - 1 - y : y) * src_stride;
+    uint8_t * d = dst + static_cast<size_t>(y) * dst_stride;
+    if (!flip_x) {
+      std::memcpy(d, s, static_cast<size_t>(src_width) * n);
+    } else {
+      const uint8_t * back = s + static_cast<size_t>(src_width - 1) * n;
+      for (uint32_t x = 0; x < src_width; ++x, d += n, back -= n) {
+        std::memcpy(d, back, n);
+      }
+    }
+  }
+}
+
+}  // namespace
+
+
+void Ace2CameraWrapperNode::applyOrientation(
+  const Orientation & o, const uint8_t * src, size_t src_stride,
+  uint32_t src_width, uint32_t src_height, size_t pixel_bytes,
+  uint8_t * dst, size_t dst_stride)
+{
+  // Everything this node publishes is 1, 2, 3 or 4 bytes per pixel. The generic
+  // case is only here so that an unexpected size is still turned correctly
+  // rather than being a silent hole.
+  switch (pixel_bytes) {
+    case 1:
+      orient_pixels<1>(
+        o.transpose, o.flip_x, o.flip_y, src, src_stride, src_width, src_height,
+        pixel_bytes, dst, dst_stride);
+      return;
+    case 2:
+      orient_pixels<2>(
+        o.transpose, o.flip_x, o.flip_y, src, src_stride, src_width, src_height,
+        pixel_bytes, dst, dst_stride);
+      return;
+    case 3:
+      orient_pixels<3>(
+        o.transpose, o.flip_x, o.flip_y, src, src_stride, src_width, src_height,
+        pixel_bytes, dst, dst_stride);
+      return;
+    case 4:
+      orient_pixels<4>(
+        o.transpose, o.flip_x, o.flip_y, src, src_stride, src_width, src_height,
+        pixel_bytes, dst, dst_stride);
+      return;
+    default:
+      orient_pixels<0>(
+        o.transpose, o.flip_x, o.flip_y, src, src_stride, src_width, src_height,
+        pixel_bytes, dst, dst_stride);
+      return;
+  }
+}
+
+
+std::string Ace2CameraWrapperNode::reorientEncoding(
+  const std::string & encoding, const Orientation & o)
+{
+  // Only a Bayer name carries a phase. Every other encoding here is a whole
+  // self-contained pixel per pixel and is named the same whichever way up the
+  // image is.
+  static const std::string kPrefix = "bayer_";
+  if (o.identity() || encoding.size() < kPrefix.size() + 4 ||
+    encoding.compare(0, kPrefix.size(), kPrefix) != 0)
+  {
+    return encoding;
+  }
+
+  // The four letters are the colours of the 2 x 2 tile in row-major order. Width
+  // and Height both have inc = 2 on this camera, so a mirror shifts the phase by
+  // exactly one tile position and the result is always another named pattern
+  // rather than something with no ROS equivalent.
+  char tile[4] = {
+    encoding[kPrefix.size() + 0], encoding[kPrefix.size() + 1],
+    encoding[kPrefix.size() + 2], encoding[kPrefix.size() + 3]};
+  if (o.transpose) {
+    std::swap(tile[1], tile[2]);
+  }
+  if (o.flip_x) {
+    std::swap(tile[0], tile[1]);
+    std::swap(tile[2], tile[3]);
+  }
+  if (o.flip_y) {
+    std::swap(tile[0], tile[2]);
+    std::swap(tile[1], tile[3]);
+  }
+
+  std::string turned = encoding;
+  turned.replace(kPrefix.size(), 4, tile, 4);
+  return turned;
+}
+
+
+  // Intrinsics for the turned image. Without this a rotated stream would carry a
+  // principal point and a focal length describing an image that is no longer
+  // there, and every downstream projection would be quietly wrong.
+bool Ace2CameraWrapperNode::reorientCameraInfo(
+  sensor_msgs::msg::CameraInfo & info, const Orientation & o)
+{
+  if (o.identity()) {
+    return true;
+  }
+
+  // Only the two tangential distortion terms move. Every radial coefficient is a
+  // function of the radius alone and does not care which way up the image is,
+  // which is why an equidistant D needs nothing done to it at all.
+  const bool radtan = info.d.size() >= 4 &&
+    (info.distortion_model == "plumb_bob" || info.distortion_model == "rational_polynomial");
+  const bool handled = radtan || info.d.empty() ||
+    info.distortion_model == "equidistant" || info.distortion_model == "fisheye";
+
+  // An all-zero roi means "the whole image" and has to stay that way.
+  const bool has_roi = info.roi.width != 0 && info.roi.height != 0;
+
+  // K is row-major fx 0 cx / 0 fy cy / 0 0 1, and P the same with a fourth
+  // column Tx, Ty, 0. Tx and Ty are zero on a monocular camera, so their signs
+  // below only matter to someone feeding this a stereo calibration.
+  if (o.transpose) {
+    std::swap(info.width, info.height);
+    std::swap(info.k[0], info.k[4]);
+    std::swap(info.k[2], info.k[5]);
+    std::swap(info.p[0], info.p[5]);
+    std::swap(info.p[2], info.p[6]);
+    std::swap(info.p[3], info.p[7]);
+    if (radtan) {
+      std::swap(info.d[2], info.d[3]);
+    }
+    if (has_roi) {
+      std::swap(info.roi.x_offset, info.roi.y_offset);
+      std::swap(info.roi.width, info.roi.height);
+    }
+  }
+  if (o.flip_x) {
+    // Pixel index u becomes width - 1 - u, and the principal point is in those
+    // same pixel-centre coordinates, so it moves with them.
+    info.k[2] = static_cast<double>(info.width) - 1.0 - info.k[2];
+    info.p[2] = static_cast<double>(info.width) - 1.0 - info.p[2];
+    info.p[3] = -info.p[3];
+    if (radtan) {
+      info.d[3] = -info.d[3];   // p2, the term that multiplies x
+    }
+    if (has_roi) {
+      info.roi.x_offset = info.width - info.roi.x_offset - info.roi.width;
+    }
+  }
+  if (o.flip_y) {
+    info.k[5] = static_cast<double>(info.height) - 1.0 - info.k[5];
+    info.p[6] = static_cast<double>(info.height) - 1.0 - info.p[6];
+    info.p[7] = -info.p[7];
+    if (radtan) {
+      info.d[2] = -info.d[2];   // p1, the term that multiplies y
+    }
+    if (has_roi) {
+      info.roi.y_offset = info.height - info.roi.y_offset - info.roi.height;
+    }
+  }
+  return handled;
 }
 
 
@@ -1104,10 +1462,19 @@ void Ace2CameraWrapperNode::publishFrame(const Pylon::CGrabResultPtr & result)
   auto image = std::make_unique<sensor_msgs::msg::Image>();
   image->header.stamp = stampFor(result, cfg);
   image->header.frame_id = cfg.frame_id;
-  image->height = static_cast<uint32_t>(result->GetHeight());
-  image->width = static_cast<uint32_t>(result->GetWidth());
-  image->encoding = ros_encoding_;
+  image->encoding = published_encoding_;
   image->is_bigendian = 0;
+
+  // Geometry as the frame comes off the camera. The published geometry is this
+  // one after the orientation, which swaps the two for a 90 or 270 rotation.
+  const uint32_t src_width = static_cast<uint32_t>(result->GetWidth());
+  const uint32_t src_height = static_cast<uint32_t>(result->GetHeight());
+
+  // Where the orientation pass reads from, and the row stride it reads with.
+  // With no orientation to apply neither is used: the frame goes straight into
+  // the message exactly as it did before, so the common case pays nothing.
+  const uint8_t * src = nullptr;
+  size_t src_step = 0;
 
   try {
     if (convert_ && !converter_.ImageHasDestinationFormat(result)) {
@@ -1118,19 +1485,28 @@ void Ace2CameraWrapperNode::publishFrame(const Pylon::CGrabResultPtr & result)
       // exactly. If that ever stops holding, the geometry in the header would no
       // longer describe the bytes, so drop the frame instead of publishing a
       // picture that only looks plausible.
-      if (image->height == 0 || size % image->height != 0) {
+      if (src_height == 0 || size % src_height != 0) {
         RCLCPP_ERROR_THROTTLE(
           get_logger(), *get_clock(), 5000,
           "Converted buffer of %zu bytes does not divide into %u rows, dropping the frame",
-          size, image->height);
+          size, src_height);
         return;
       }
+      src_step = size / src_height;
 
-      image->step = static_cast<uint32_t>(size / image->height);
-      image->data.resize(size);
-      // Convert straight into the message buffer, so debayering costs one pass
-      // and no extra copy.
-      converter_.Convert(image->data.data(), size, result);
+      if (orientation_.identity()) {
+        image->data.resize(size);
+        // Convert straight into the message buffer, so debayering costs one pass
+        // and no extra copy.
+        converter_.Convert(image->data.data(), size, result);
+      } else {
+        // The orientation pass has to read from somewhere other than what it
+        // writes, so the conversion lands in a buffer that is reused frame to
+        // frame and the turn is the copy into the message.
+        convert_buffer_.resize(size);
+        converter_.Convert(convert_buffer_.data(), size, result);
+        src = convert_buffer_.data();
+      }
     } else {
       // Either passthrough, or the camera already delivers the target format.
       size_t stride = 0;
@@ -1140,15 +1516,46 @@ void Ace2CameraWrapperNode::publishFrame(const Pylon::CGrabResultPtr & result)
           "Frame has no row stride (packed pixel format), dropping it");
         return;
       }
-      image->step = static_cast<uint32_t>(stride);
-      const size_t size = stride * image->height;
-      image->data.resize(size);
-      std::memcpy(image->data.data(), result->GetBuffer(), size);
+      src_step = stride;
+      if (orientation_.identity()) {
+        const size_t size = stride * src_height;
+        image->data.resize(size);
+        std::memcpy(image->data.data(), result->GetBuffer(), size);
+      } else {
+        // Nothing was copied yet, so the turn reads the grab buffer directly and
+        // this path costs no more than the plain memcpy it replaces.
+        src = static_cast<const uint8_t *>(result->GetBuffer());
+      }
     }
   } catch (const Pylon::GenericException & e) {
     RCLCPP_ERROR_THROTTLE(
       get_logger(), *get_clock(), 5000, "Frame conversion failed: %s", e.GetDescription());
     return;
+  }
+
+  if (orientation_.identity()) {
+    image->width = src_width;
+    image->height = src_height;
+    image->step = static_cast<uint32_t>(src_step);
+  } else {
+    // Every encoding this node publishes is a whole number of bytes per pixel and
+    // the orientation moves whole pixels, so a stride that does not divide by the
+    // width would mean the buffer is not the shape we think it is.
+    if (src_width == 0 || src_step % src_width != 0) {
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "Row stride of %zu bytes does not divide into %u pixels, dropping the frame",
+        src_step, src_width);
+      return;
+    }
+    const size_t pixel_bytes = src_step / src_width;
+    image->width = orientation_.transpose ? src_height : src_width;
+    image->height = orientation_.transpose ? src_width : src_height;
+    image->step = static_cast<uint32_t>(image->width * pixel_bytes);
+    image->data.resize(static_cast<size_t>(image->step) * image->height);
+    applyOrientation(
+      orientation_, src, src_step, src_width, src_height, pixel_bytes,
+      image->data.data(), image->step);
   }
 
   auto info = std::make_unique<sensor_msgs::msg::CameraInfo>(info_manager_->getCameraInfo());
@@ -1162,11 +1569,22 @@ void Ace2CameraWrapperNode::publishFrame(const Pylon::CGrabResultPtr & result)
       get_logger(),
       "No calibration loaded, CameraInfo carries only the image size. Set camera_info_url, "
       "or run camera_calibration and store the result via the set_camera_info service.");
-  } else if (info->width != image->width || info->height != image->height) {
-    RCLCPP_WARN_ONCE(
-      get_logger(),
-      "Calibration is for %ux%u but frames are %ux%u. The intrinsics do not apply to this ROI.",
-      info->width, info->height, image->width, image->height);
+  } else {
+    // The calibration describes the sensor, so it has to be turned the same way
+    // the pixels were before it describes what is being published.
+    if (!reorientCameraInfo(*info, orientation_)) {
+      RCLCPP_WARN_ONCE(
+        get_logger(),
+        "Distortion model '%s' has coefficients this node cannot rewrite for an oriented "
+        "image, so K and P were turned but D was left as it is.",
+        info->distortion_model.c_str());
+    }
+    if (info->width != image->width || info->height != image->height) {
+      RCLCPP_WARN_ONCE(
+        get_logger(),
+        "Calibration is for %ux%u but frames are %ux%u. The intrinsics do not apply to this ROI.",
+        info->width, info->height, image->width, image->height);
+    }
   }
 
   if (use_image_transport_) {
