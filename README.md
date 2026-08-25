@@ -212,6 +212,44 @@ exposure and transfer latency.
 
 ## Things that will bite you
 
+**`no Basler camera found` while `lsusb` shows the camera.** pylon drives the
+camera through libusb, which needs read *and* write access to
+`/dev/bus/usb/<bus>/<device>`. `lsusb` only reads descriptors, which the read bit
+alone allows, so with the wrong permissions the camera is listed by `lsusb` and
+still invisible to `CTlFactory::EnumerateDevices`, which returns zero devices and
+makes the node throw. Read access is enough to see the camera and not enough to
+open it, which is why this looks like a missing camera rather than a denied one.
+
+pylon's installer ships the rule that fixes it:
+
+```
+# /etc/udev/rules.d/69-basler-cameras.rules
+SUBSYSTEM=="usb", ATTRS{idVendor}=="2676", MODE:="0666", TAG+="uaccess", TAG+="udev-acl"
+```
+
+**That rule only takes effect on the host.** If the node runs inside Docker, the
+copy of the rule in the image does nothing: no udev daemon runs in a Docker
+container, and `/dev/bus/usb` is bind-mounted from the host's devtmpfs, so the mode
+is whatever the host assigned. Installing pylon in the image therefore does not
+grant access to the camera. Put the rule on the *host*, reload it, and replug the
+camera:
+
+```bash
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+Because it is a bind mount, the corrected mode shows up inside the Docker
+container immediately, with no image rebuild and no restart. Verify from wherever
+the node actually runs:
+
+```bash
+lsusb | grep -i basler        # -> Bus 004 Device 002: ID 2676:ba05 Basler ...
+ls -l /dev/bus/usb/004/002    # want crw-rw-rw-, not crw-rw-r--
+```
+
+A one-off `sudo chmod 666 /dev/bus/usb/004/002` unblocks the camera now and is lost
+on the next replug.
+
 **QoS.** The publisher defaults to `best_effort` with depth 1, which is the usual
 profile for a sensor stream and the only sane one for 15 MB frames. A subscriber
 that asks for `RELIABLE` will not connect to a `best_effort` publisher and will
@@ -244,6 +282,11 @@ works either way:
 echo 'w /sys/module/usbcore/parameters/usbfs_memory_mb - - - - 1000' \
   | sudo tee /etc/tmpfiles.d/usbfs-memory.conf
 ```
+
+All three commands target the host, since `/sys/module/usbcore` belongs to the
+kernel and a Docker container has no writable copy of it. Setting this from inside
+a container fails even as root, so raise it on the host and read the value back
+from the container to confirm it applied.
 
 **`Off` and `On` are YAML booleans.** `exposure_auto`, `gain_auto`,
 `balance_white_auto`, `light_source_preset`, `color_space` and `trigger_mode` all
