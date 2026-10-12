@@ -183,6 +183,10 @@ private:
 
   void publishFrame(const Pylon::CGrabResultPtr & result);
 
+  // A small bgr8 copy of the frame on ace2/preview, at most preview_max_hz, for the
+  // operator video stream (see preview.hpp). Grab thread only.
+  void publishPreview(const sensor_msgs::msg::Image & image);
+
   bool useCameraClock() const;
 
   void interruptibleSleep(double seconds);
@@ -243,6 +247,11 @@ private:
   image_transport::CameraPublisher camera_pub_;
   std::shared_ptr<camera_info_manager::CameraInfoManager> info_manager_;
   rclcpp::Publisher<sensor_msgs::msg::Temperature>::SharedPtr temperature_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr preview_pub_;
+  bool publish_preview_{false};
+  int64_t preview_downscale_{4};
+  double preview_max_hz_{15.0};
+  std::chrono::steady_clock::time_point last_preview_{};
   rclcpp::TimerBase::SharedPtr temperature_timer_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr trigger_srv_;
   OnSetParametersCallbackHandle::SharedPtr param_cb_;
