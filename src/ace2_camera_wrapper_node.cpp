@@ -23,6 +23,7 @@
 //   time periodically so the two oscillators cannot drift apart without bound.
 
 #include "ace2_camera_wrapper/ace2_camera_wrapper_node.hpp"
+#include "ace2_camera_wrapper/preview.hpp"
 
 #include <rclcpp_components/register_node_macro.hpp>
 #include <sensor_msgs/image_encodings.hpp>
@@ -144,6 +145,15 @@ Ace2CameraWrapperNode::Ace2CameraWrapperNode(const rclcpp::NodeOptions & options
     "~/execute_software_trigger",
     std::bind(&Ace2CameraWrapperNode::onSoftwareTrigger, this,
               std::placeholders::_1, std::placeholders::_2));
+
+  if (publish_preview_) {
+    // Reliable, depth 1: matches any subscriber, and a slow one only ever gets the newest.
+    preview_pub_ = create_publisher<sensor_msgs::msg::Image>(
+      "ace2/preview", rclcpp::QoS(rclcpp::KeepLast(1)).reliable());
+    RCLCPP_INFO(
+      get_logger(), "Publishing '%s', %ld times smaller, at most %.0f Hz",
+      preview_pub_->get_topic_name(), preview_downscale_, preview_max_hz_);
+  }
 
   if (temperature_period_ > 0.0) {
     temperature_pub_ = create_publisher<sensor_msgs::msg::Temperature>("~/temperature", 10);
@@ -394,6 +404,18 @@ void Ace2CameraWrapperNode::declareParameters()
   temperature_period_ = declare<double>(
     "temperature_publish_period", 0.0,
     "Period in seconds for publishing DeviceTemperature on ~/temperature. 0 disables.");
+
+  // -- operator preview ----------------------------------------------------
+  publish_preview_ = declare<bool>(
+    "publish_preview", false,
+    "Also publish ace2/preview: an 8-bit bgr8 copy of every frame, preview_downscale times "
+    "smaller on each side, at most preview_max_hz. For the operator video stream, which "
+    "cannot take full frames from another process at the camera rate.");
+  preview_downscale_ = declare<int64_t>(
+    "preview_downscale", 4,
+    "Preview shrink factor on each side, even for Bayer frames. 4 turns 2448x2048 into 612x512.");
+  preview_max_hz_ = declare<double>(
+    "preview_max_hz", 15.0, "Highest preview rate. 0 or less publishes one per frame.");
 }
 
 
@@ -1587,6 +1609,10 @@ void Ace2CameraWrapperNode::publishFrame(const Pylon::CGrabResultPtr & result)
     }
   }
 
+  if (preview_pub_) {
+    publishPreview(*image);
+  }
+
   if (use_image_transport_) {
     // image_transport dereferences and copies whatever it is given, on every
     // overload, so there is nothing to gain from moving here.
@@ -1598,6 +1624,27 @@ void Ace2CameraWrapperNode::publishFrame(const Pylon::CGrabResultPtr & result)
     image_pub_->publish(std::move(image));
     info_pub_->publish(std::move(info));
   }
+}
+
+
+void Ace2CameraWrapperNode::publishPreview(const sensor_msgs::msg::Image & image)
+{
+  const auto now = std::chrono::steady_clock::now();
+  if (preview_max_hz_ > 0.0 &&
+    now - last_preview_ < std::chrono::duration<double>(1.0 / preview_max_hz_))
+  {
+    return;
+  }
+  auto preview = std::make_unique<sensor_msgs::msg::Image>();
+  if (!makePreview(image, static_cast<int>(preview_downscale_), significantBits(pixel_format_), *preview)) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 10000,
+      "No preview for a %ux%u '%s' frame at preview_downscale %ld",
+      image.width, image.height, image.encoding.c_str(), preview_downscale_);
+    return;
+  }
+  last_preview_ = now;
+  preview_pub_->publish(std::move(preview));
 }
 
 

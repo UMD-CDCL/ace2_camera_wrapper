@@ -99,6 +99,10 @@ def generate_launch_description():
                         'components in that container receive frames without a copy. '
                         'false runs it as its own process, exactly as before.'),
         DeclareLaunchArgument(
+            'publish_preview', default_value='false',
+            description='Also publish ace2/preview, a small bgr8 copy of every frame (4 times '
+                        'smaller, at most 15 Hz) for an operator video stream.'),
+        DeclareLaunchArgument(
             'container_name', default_value='ace2_camera_container',
             description='Name of the component container created when use_composition '
                         'is true.'),
@@ -268,6 +272,12 @@ def generate_launch_description():
         # only what survived the transport.
         'stats_log_period': ParameterValue(
             LaunchConfiguration('stats_log_period'), value_type=float),
+
+        # ------------------------------------------------- operator preview ----
+        'publish_preview': ParameterValue(
+            LaunchConfiguration('publish_preview'), value_type=bool),
+        'preview_downscale': 4,
+        'preview_max_hz': 15.0,
     }
 
     # The node publishes ace2/image_raw and ace2/camera_info by default, which land
